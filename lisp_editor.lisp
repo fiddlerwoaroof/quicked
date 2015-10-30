@@ -10,14 +10,12 @@
   (:use :cl :cl-charms :cells :alexandria :anaphora))
 (in-package :lisp-edit)
 
-
 (defun apply-cursor-action (action)
   (case action
     ((:up)    (cons  0 -1))
     ((:down)  (cons  0  1))
     ((:left)  (cons -1  0))
     ((:right) (cons  1  0))))
-
 
 (defun dispatch-char (c)
   (case c
@@ -35,10 +33,24 @@
 
 (defmodel cursor ()
           ((action :cell :ephemeral :initarg :action :accessor action :initform (c-in nil))
+           (current-char :initarg :current-char :accessor current-char :initform (c-in nil))
            (delta :accessor cursor-delta :initform
                   (c? (apply-cursor-action (^action))))
            (x :accessor cursor-x :initarg :x :initform (c... (0) (car (^cursor-delta))))
            (y :accessor cursor-y :initarg :y :initform (c... (0) (cdr (^cursor-delta))))))
+
+(defun map-actions (current-char action)
+  (case action
+    ((:paint) (case current-char
+                ((#\#) #\Space)
+                ((#\Space) #\*)
+                ((#\*) #\#)))))
+
+(defmodel painter ()
+          ((action :cell :ephemeral :initarg :action :accessor action :initform (c-in nil))
+           (current-char :initarg :current-char :accessor current-char :initform (c-in nil))
+           (output :cell :ephemeral :accessor output :initform (c? (map-actions (^current-char)
+                                                                                (^action))))))
 
 (defvar *input-handler*)
 (defvar *painter*)
@@ -72,38 +84,54 @@
       (enable-raw-input :interpret-control-characters t)
       (enable-non-blocking-mode *standard-window*)
 
-      (let* ((*input-handler* (make-instance 'input-handler))
-             (*cursor* (make-instance 'cursor :action (c? (action *input-handler*))))
-             (screen-dimensions (multiple-value-list (window-dimensions *standard-window*))))
+      (setf *input-handler* (make-instance 'input-handler) 
+            *cursor* (make-instance 'cursor :action (c? (action *input-handler*)))
+            *painter* (make-instance 'painter
+                                     :action (c? (action *input-handler*))
+                                     :current-char (c? (current-char *cursor*))))
 
-        (defobserver action ((self input-handler))
-                    (case new-value
-                      ((:paint) (paint))))
+      (let* ((screen-dimensions (multiple-value-bind (x y) (window-dimensions *standard-window*)
+                                  (cons x y))))
+        (labels
+          ((set-current-char (cursor)
+             (with-restored-cursor *standard-window*
+               (setf (current-char cursor) (char-at-cursor *standard-window*))))
+           (mvc (x y)
+             (move-cursor *standard-window* x y)
+             (set-current-char *cursor*))
+           (constrain-coordinate (side coord)
+             (mod coord (funcall
+                          (ecase side
+                            ((:x) #'car)
+                            ((:y) #'cdr))
+                          screen-dimensions))))
 
+          (defobserver output ((self painter))
+                       (with-restored-cursor *standard-window*
+                         (write-char-at-cursor *standard-window* new-value))
+                       (with-integrity (:change)
+                         (set-current-char *cursor*)))
 
-        (defobserver y ((self cursor))
-                     (with-integrity (:change)
-                                     (let ((adjusted-n-v (mod new-value
-                                                              (cadr screen-dimensions))))
-                                       (if (/= new-value adjusted-n-v)
-                                         (setf (^cursor-y) (- adjusted-n-v new-value))
-                                         (move-cursor *standard-window*
-                                                      (^cursor-x) adjusted-n-v)))))
+          (defobserver y ((self cursor))
+                       (with-integrity (:change)
+                         (let ((adjusted-n-v (constrain-coordinate :y new-value)))
+                           (if (/= new-value adjusted-n-v)
+                             (setf (^cursor-y) (- adjusted-n-v new-value))
+                             (mvc (^cursor-x) adjusted-n-v)))))
 
-        (defobserver x ((self cursor))
-                     (with-integrity (:change)
-                                     (let ((adjusted-n-v (mod new-value
-                                                              (car screen-dimensions))))
-                                       (if (/= new-value adjusted-n-v)
-                                         (setf (^cursor-x) (- adjusted-n-v new-value))
-                                         (move-cursor *standard-window*
-                                                      adjusted-n-v (^cursor-y))))))
+          (defobserver x ((self cursor))
+                       (with-integrity (:change)
+                         (let ((adjusted-n-v (constrain-coordinate :x new-value)))
+                           (if (/= new-value adjusted-n-v)
+                             (setf (^cursor-x) (- adjusted-n-v new-value))
+                             (mvc adjusted-n-v (^cursor-y))))))
 
-        (loop :named driver-loop
-              :for c := (get-char *standard-window* :ignore-error t)
-              :do (progn
-                    (refresh-window *standard-window*)
+          (mvc 0 0)
+          (loop :named driver-loop
+                :for c := (get-char *standard-window* :ignore-error t)
+                :do (progn
+                      (refresh-window *standard-window*)
+                      (setf (input-key *input-handler*) c))))))
 
-                    (setf (input-key *input-handler*) c)))))
     (sb-sys:interactive-interrupt (c) (declare (ignore c)))))
 
